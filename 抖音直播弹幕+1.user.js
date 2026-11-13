@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音直播弹幕 +1
 // @namespace    https://github.com/hexiosr/douyin-danma-plus-one
-// @version      1.0.5
+// @version      1.0.6
 // @description  在抖音直播聊天列表的每条弹幕旁加一个 +1，点击后发送相同内容
 // @license      MIT
 // @icon         https://cdn.jsdelivr.net/gh/hexiosr/douyin-danma-plus-one@main/icon.png
@@ -21,7 +21,7 @@
   const CONTENT_SELECTOR = '.webcast-chatroom___content-with-emoji-text';
   const ROOM_NOTICE_SELECTOR = '.webcast-chatroom__room-message';
   const EDITOR_SELECTOR = ".zone-container[contenteditable='true'], [data-slate-editor='true'][contenteditable='true']";
-  const SEND_SELECTOR = ".webcast-chatroom___send-btn, [data-e2e='chat-send-btn']";
+  const SEND_SELECTOR = ".webcast-chatroom___send-btn, [data-e2e='chat-send-btn'], [class*='send-btn'], [class*='sendBtn'], [class*='send_btn']";
   const SYSTEM_TEXT = /^(来了|为主播点赞了|关注了主播|加入了直播间|分享了直播间|送出)/;
   const MAX_TEXT = 500;
 
@@ -202,12 +202,16 @@
 
   function findSend(editor) {
     const scope = editor.closest('#chatInput, .webcast-chatroom, [class*="chatroom"]');
-    const within = scope ? [...scope.querySelectorAll(SEND_SELECTOR)].find(isVisible) : null;
-    if (within) return within;
-    const global = [...document.querySelectorAll(SEND_SELECTOR)].find(isVisible);
-    if (global) return global;
-    return [...(scope || document).querySelectorAll('button, [role="button"]')]
-      .find(el => isVisible(el) && /^发送$/.test((el.textContent || '').trim())) || null;
+    const byText = el => /^发送$/.test((el.textContent || '').trim());
+    for (const root of [scope, document]) {
+      if (!root) continue;
+      const hit = [...root.querySelectorAll(SEND_SELECTOR)].find(isVisible);
+      if (hit) return hit;
+      const text = [...root.querySelectorAll('button, [role="button"], [class*="btn"], [class*="button"]')]
+        .find(el => isVisible(el) && byText(el));
+      if (text) return text;
+    }
+    return null;
   }
 
   function unavailable(el) {
@@ -322,14 +326,36 @@
     try { document.execCommand('delete'); } catch { /* 清不掉时会提示手动清空 */ }
   }
 
-  function pressEnter(editor) {
-    const init = {
+  function enterEvent(type) {
+    const event = new KeyboardEvent(type, {
       key: 'Enter', code: 'Enter',
       bubbles: true, composed: true, cancelable: true,
-    };
-    editor.dispatchEvent(new KeyboardEvent('keydown', init));
-    editor.dispatchEvent(new KeyboardEvent('keypress', init));
-    editor.dispatchEvent(new KeyboardEvent('keyup', init));
+    });
+    // KeyboardEvent 构造器不认 keyCode/which，但有的站点只按这两个旧字段判断回车。
+    const code = type === 'keypress' ? 13 : 0;
+    Object.defineProperties(event, {
+      keyCode: { get: () => 13 },
+      which: { get: () => 13 },
+      charCode: { get: () => code },
+    });
+    return event;
+  }
+
+  function pressEnter(editor) {
+    editor.dispatchEvent(enterEvent('keydown'));
+    editor.dispatchEvent(enterEvent('keypress'));
+    editor.dispatchEvent(enterEvent('keyup'));
+  }
+
+  function clickElement(el) {
+    const base = { bubbles: true, cancelable: true, composed: true, view: window, button: 0 };
+    if (typeof PointerEvent === 'function') {
+      el.dispatchEvent(new PointerEvent('pointerdown', { ...base, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+      el.dispatchEvent(new PointerEvent('pointerup', { ...base, pointerId: 1, pointerType: 'mouse', isPrimary: true }));
+    }
+    el.dispatchEvent(new MouseEvent('mousedown', base));
+    el.dispatchEvent(new MouseEvent('mouseup', base));
+    el.dispatchEvent(new MouseEvent('click', base));
   }
 
   async function waitCleared(ms) {
@@ -375,11 +401,11 @@
       lastSend = Date.now();
       editor.focus({ preventScroll: true });
       pressEnter(editor);
-      if (await waitCleared(1200)) { toast('已发送 +1'); return; }
+      if (await waitCleared(1600)) { toast('已发送 +1'); return; }
       const send = findSend(editor);
-      if (send && !unavailable(send)) {
-        send.click();
-        if (await waitCleared(1200)) { toast('已发送 +1'); return; }
+      if (send && send.isConnected && !send.disabled) {
+        clickElement(send);
+        if (await waitCleared(1600)) { toast('已发送 +1'); return; }
       }
       toast('已填入内容，请手动发送');
     } finally {
