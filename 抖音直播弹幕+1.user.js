@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音直播弹幕 +1
 // @namespace    https://github.com/hexiosr/douyin-danma-plus-one
-// @version      1.0.6
+// @version      1.0.7
 // @description  在抖音直播聊天列表的每条弹幕旁加一个 +1，点击后发送相同内容
 // @license      MIT
 // @icon         https://cdn.jsdelivr.net/gh/hexiosr/douyin-danma-plus-one@main/icon.png
@@ -285,7 +285,7 @@
     if (!toastEl) {
       toastEl = document.createElement('div');
       Object.assign(toastEl.style, {
-        position: 'fixed', left: '16px', bottom: '96px', zIndex: '2147483647',
+        position: 'fixed', right: '16px', bottom: '96px', zIndex: '2147483647',
         padding: '7px 12px', border: '1px solid #444653', borderRadius: '8px',
         background: 'rgba(28,29,38,.94)', color: '#f5f6fa', pointerEvents: 'none',
         font: '13px/1.5 system-ui,-apple-system,"Microsoft YaHei",sans-serif',
