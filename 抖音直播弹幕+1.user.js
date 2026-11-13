@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音直播弹幕 +1
 // @namespace    https://github.com/hexiosr/douyin-danma-plus-one
-// @version      1.0.7
+// @version      1.0.8
 // @description  在抖音直播聊天列表的每条弹幕旁加一个 +1，点击后发送相同内容
 // @license      MIT
 // @icon         https://cdn.jsdelivr.net/gh/hexiosr/douyin-danma-plus-one@main/icon.png
@@ -188,6 +188,85 @@
     clearTimeout(hoverTimer);
     hideCardSoon();
   });
+
+  // 往上翻聊天记录时锁住位置，新弹幕不再把列表顶回底部；翻回底部自动恢复。
+  let scroller = null;
+  let scrollLocked = false;
+  let userScrollUntil = 0;
+  let lockTop = 0;
+  let lockRaf = 0;
+  let pointerHeld = false;
+
+  const releasePointer = () => { pointerHeld = false; };
+  window.addEventListener('pointerup', releasePointer, { passive: true, capture: true });
+  window.addEventListener('pointercancel', releasePointer, { passive: true, capture: true });
+
+  function chatScroller() {
+    let el = document.querySelector(ITEM_SELECTOR)?.parentElement;
+    while (el && el !== document.body) {
+      const style = getComputedStyle(el);
+      if (/(auto|scroll|overlay)/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 10) return el;
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  function atBottom(el) {
+    return el.scrollHeight - el.scrollTop - el.clientHeight < 8;
+  }
+
+  function lockTick() {
+    lockRaf = 0;
+    if (!scrollLocked || !scroller?.isConnected) return;
+    if (Date.now() < userScrollUntil) {
+      // 用户正在滚，位置跟着手走。
+      lockTop = scroller.scrollTop;
+    } else if (Math.abs(scroller.scrollTop - lockTop) > 1) {
+      // 站点为新弹幕自动滚到底，拉回用户停下的位置。
+      scroller.scrollTop = lockTop;
+    }
+    if (Date.now() >= userScrollUntil && atBottom(scroller)) {
+      scrollLocked = false;
+      return;
+    }
+    lockRaf = requestAnimationFrame(lockTick);
+  }
+
+  function startLock() {
+    if (!scroller || atBottom(scroller)) return;
+    lockTop = scroller.scrollTop;
+    if (!scrollLocked) {
+      scrollLocked = true;
+      if (!lockRaf) lockRaf = requestAnimationFrame(lockTick);
+    }
+  }
+
+  function bindScroller() {
+    const el = chatScroller();
+    if (!el || el === scroller) return;
+    scroller = el;
+    el.addEventListener('wheel', () => {
+      userScrollUntil = Date.now() + 250;
+      startLock();
+    }, { passive: true });
+    el.addEventListener('touchmove', () => {
+      userScrollUntil = Date.now() + 300;
+      startLock();
+    }, { passive: true });
+    el.addEventListener('pointerdown', () => {
+      pointerHeld = true;
+      userScrollUntil = Date.now() + 400;
+      startLock();
+    }, { passive: true });
+    el.addEventListener('scroll', () => {
+      // 拖滚动条时 pointerup 前一直算用户操作，别把位置抢回去。
+      if (pointerHeld) userScrollUntil = Date.now() + 300;
+      if (Date.now() < userScrollUntil) startLock();
+    }, { passive: true });
+  }
+
+  bindScroller();
+  setInterval(bindScroller, 1500);
 
   function findEditor() {
     for (const scope of [...document.querySelectorAll('#chatInput')].filter(isVisible)) {
