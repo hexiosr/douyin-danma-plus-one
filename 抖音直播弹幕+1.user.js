@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         抖音直播弹幕 +1
 // @namespace    https://github.com/hexiosr
-// @version      1.0.3
+// @version      1.0.4
 // @description  在抖音直播聊天列表的每条弹幕旁加一个 +1，点击后发送相同内容
 // @license      MIT
+// @icon         https://cdn.jsdelivr.net/gh/hexiosr/douyin-danma-plus-one@main/icon.png
 // @homepageURL  https://github.com/hexiosr/douyin-danma-plus-one
 // @supportURL   https://github.com/hexiosr/douyin-danma-plus-one/issues
 // @source       https://github.com/hexiosr/douyin-danma-plus-one
