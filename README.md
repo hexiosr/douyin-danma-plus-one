@@ -2,7 +2,7 @@
 
 抖音直播网页版聊天列表的 +1 脚本：鼠标停在某条弹幕上，把这条弹幕定格成固定位置的卡片，点卡片上的 +1 自动发送相同内容。
 
-GitHub：https://github.com/hexiosr/douyin-danma-plus-one
+[Greasy Fork地址](https://greasyfork.org/zh-CN/scripts/605283)
 
 ## 功能
 
@@ -14,8 +14,8 @@ GitHub：https://github.com/hexiosr/douyin-danma-plus-one
 ## 安装
 
 1. 安装 Tampermonkey 浏览器扩展
-2. 打开 [抖音直播弹幕+1.user.js](./抖音直播弹幕+1.user.js)，点右上角 `Raw`
-3. Tampermonkey 会弹出安装页面，点安装即可
+2. [Greasy Fork地址](https://greasyfork.org/zh-CN/scripts/605283) 
+3. 点安装即可
 
 ## 使用
 
@@ -28,9 +28,6 @@ GitHub：https://github.com/hexiosr/douyin-danma-plus-one
 - 弹幕字数上限由抖音按账号/客户端控制，超限的弹幕不会自动发送
 - 发送前会清空输入框里的原有内容
 
-## 版本
-
-1.0.3
 
 ## 许可证
 
