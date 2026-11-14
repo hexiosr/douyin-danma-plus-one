@@ -362,9 +362,16 @@
   }
 
   function onListScroll(event) {
-    const el = frozenEl;
-    if (!paused || !el || event.target !== el) return;
+    const el = event.target;
+    if (!(el instanceof Element)) return;
     if (pointerHeld) lastUserInput = Date.now();
+    // 从底部往上拖滚动条时 pointerdown 不会命中列表本身，这里补上冻结。
+    if (pointerHeld && !paused && el === scroller &&
+        el.scrollHeight > el.clientHeight + 4 && !atBottom(el)) {
+      freezeList(el, false);
+      return;
+    }
+    if (!paused || el !== frozenEl) return;
     if (!atBottom(el)) return;
     // 冻结期间站点写不进 scrollTop，滚到底只可能是用户自己在往下翻。
     if (pointerHeld || (lastDir > 0 && Date.now() - lastUserInput < 600)) unfreezeList();
