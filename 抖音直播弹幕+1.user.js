@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音直播弹幕 +1
 // @namespace    https://github.com/hexiosr/douyin-danma-plus-one
-// @version      1.1.3
+// @version      1.1.4
 // @description  在抖音直播聊天列表的每条弹幕旁加一个 +1，点击后发送相同内容
 // @license      MIT
 // @icon         https://cdn.jsdelivr.net/gh/hexiosr/douyin-danma-plus-one@main/icon.png
@@ -131,7 +131,8 @@
   let lastDir = 0;
   let pointerHeld = false;
   let lastUserInput = 0;
-  let pauseTimer = 0;
+  let pauseRaf = 0;
+  let lastSampleAt = 0;
   let samples = [];
   let lastFrozenSt = 0;
   let frozenHref = '';
@@ -153,7 +154,7 @@
       if (!key) continue;
       const rect = item.getBoundingClientRect();
       const off = rect.top - top;
-      if (rect.height && off + rect.height > 0 && off < height) samples.push({ key, off });
+      if (rect.height && off + rect.height > 0 && off < height) samples.push({ key, off, item });
     }
   }
 
@@ -162,20 +163,24 @@
   }
 
   // 把最早还在视口里的锚点弹幕挪回冻结时的位置，返回是否找到锚点。
+  // 走原生 setter，绕过我们自己挡住的赋值；每帧只校一个锚点，开销很小。
   function alignView(el) {
     const top = el.getBoundingClientRect().top;
-    const entries = itemEntries(el);
     for (const sample of samples) {
-      let best = null;
-      let bestGap = Infinity;
-      for (const { item, key } of entries) {
-        if (key !== sample.key) continue;
-        const gap = Math.abs(item.getBoundingClientRect().top - top - sample.off);
-        if (gap < bestGap) { bestGap = gap; best = item; }
+      let best = sample.item;
+      if (!best || !best.isConnected || (messageText(best) || textOf(best)) !== sample.key) {
+        best = null;
+        let bestGap = Infinity;
+        for (const { item, key } of itemEntries(el)) {
+          if (key !== sample.key) continue;
+          const gap = Math.abs(item.getBoundingClientRect().top - top - sample.off);
+          if (gap < bestGap) { bestGap = gap; best = item; }
+        }
+        if (!best) continue;
+        sample.item = best;
       }
-      if (!best) continue;
       const delta = (best.getBoundingClientRect().top - top) - sample.off;
-      if (Math.abs(delta) >= 4 && Math.abs(delta) < el.clientHeight) {
+      if (Math.abs(delta) >= 2 && Math.abs(delta) < el.clientHeight) {
         topAccessor.set.call(el, clampTop(el, topAccessor.get.call(el) + delta));
       }
       return true;
@@ -183,10 +188,18 @@
     return false;
   }
 
+  // 站点还可能用 scroll / scrollIntoView 把新弹幕带进视野，这两种原生滚动碰不到 scrollTop。
+  const nativeScrollIntoView = Element.prototype.scrollIntoView;
+  Element.prototype.scrollIntoView = function (...args) {
+    if (paused && frozenEl && frozenEl.contains(this)) return;
+    return nativeScrollIntoView.apply(this, args);
+  };
+
   function releaseFreeze(el) {
     delete el.scrollTop;
     delete el.scrollTo;
     delete el.scrollBy;
+    delete el.scroll;
   }
 
   function freezeList(el, restore) {
@@ -202,7 +215,8 @@
       get() { return topAccessor.get.call(this); },
       set() {},
     });
-    // scrollTo/scrollBy 也是站点滚到底的入口，一并挡住。
+    // scroll / scrollTo / scrollBy 也是站点滚到底的入口，一并挡住。
+    el.scroll = () => {};
     el.scrollTo = () => {};
     el.scrollBy = () => {};
     const kept = restore && alignView(el);
@@ -211,15 +225,17 @@
       takeSamples(el);
     }
     lastFrozenSt = topAccessor.get.call(el);
+    if (!restore) toast('已暂停滚动');
     startPauseWatch();
     placeBottomBtn();
   }
 
   function startPauseWatch() {
-    if (pauseTimer) return;
-    // 用户停手后每 250ms 校对一次画面，防止列表回收把正在看的弹幕带走。
-    pauseTimer = setInterval(() => {
-      if (!paused) return;
+    if (pauseRaf) return;
+    // 逐帧对齐：站点每把列表拉回底部一次，就在同一帧掰回来，看起来是钉住的。
+    const tick = () => {
+      if (!paused) { pauseRaf = 0; return; }
+      pauseRaf = requestAnimationFrame(tick);
       if (location.href !== frozenHref) { unfreezeList(); return; }
       const el = frozenEl;
       if (!el || !el.isConnected) {
@@ -229,18 +245,22 @@
       }
       // 用户还在滚，按当前画面更新锚点，等停下来再钉住。
       if (Date.now() - lastUserInput < 400) {
-        takeSamples(el);
+        if (Date.now() - lastSampleAt > 200) {
+          takeSamples(el);
+          lastSampleAt = Date.now();
+        }
         lastFrozenSt = topAccessor.get.call(el);
         return;
       }
       if (!alignView(el)) takeSamples(el);
       lastFrozenSt = topAccessor.get.call(el);
-    }, 250);
+    };
+    pauseRaf = requestAnimationFrame(tick);
   }
 
   function stopPauseWatch() {
-    clearInterval(pauseTimer);
-    pauseTimer = 0;
+    if (pauseRaf) cancelAnimationFrame(pauseRaf);
+    pauseRaf = 0;
   }
 
   function unfreezeList() {
