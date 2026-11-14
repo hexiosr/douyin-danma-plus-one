@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音直播弹幕 +1
 // @namespace    https://github.com/hexiosr/douyin-danma-plus-one
-// @version      1.0.8
+// @version      1.0.9
 // @description  在抖音直播聊天列表的每条弹幕旁加一个 +1，点击后发送相同内容
 // @license      MIT
 // @icon         https://cdn.jsdelivr.net/gh/hexiosr/douyin-danma-plus-one@main/icon.png
@@ -189,19 +189,21 @@
     hideCardSoon();
   });
 
-  // 往上翻聊天记录时锁住位置，新弹幕不再把列表顶回底部；翻回底部自动恢复。
+  // 抖音在滚动后会把聊天列表写回底部，拦不住事件就冻住元素自己的 scrollTop 赋值：
+  // 用户往上翻后位置定住，翻回底部再解冻，恢复新弹幕自动跟随。
+  const topAccessor = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
   let scroller = null;
-  let scrollLocked = false;
-  let userScrollUntil = 0;
-  let lockTop = 0;
-  let lockRaf = 0;
-  let pointerHeld = false;
+  let frozenEl = null;
+  let lastDir = 0;
 
-  const releasePointer = () => { pointerHeld = false; };
-  window.addEventListener('pointerup', releasePointer, { passive: true, capture: true });
-  window.addEventListener('pointercancel', releasePointer, { passive: true, capture: true });
+  window.addEventListener('pointerup', () => {
+    if (frozenEl && atBottom(frozenEl)) unfreezeList();
+  }, { passive: true, capture: true });
 
   function chatScroller() {
+    const list = [...document.querySelectorAll('.webcast-chatroom___list')]
+      .find(el => el.querySelector(ITEM_SELECTOR) && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY));
+    if (list) return list;
     let el = document.querySelector(ITEM_SELECTOR)?.parentElement;
     while (el && el !== document.body) {
       const style = getComputedStyle(el);
@@ -215,53 +217,48 @@
     return el.scrollHeight - el.scrollTop - el.clientHeight < 8;
   }
 
-  function lockTick() {
-    lockRaf = 0;
-    if (!scrollLocked || !scroller?.isConnected) return;
-    if (Date.now() < userScrollUntil) {
-      // 用户正在滚，位置跟着手走。
-      lockTop = scroller.scrollTop;
-    } else if (Math.abs(scroller.scrollTop - lockTop) > 1) {
-      // 站点为新弹幕自动滚到底，拉回用户停下的位置。
-      scroller.scrollTop = lockTop;
-    }
-    if (Date.now() >= userScrollUntil && atBottom(scroller)) {
-      scrollLocked = false;
-      return;
-    }
-    lockRaf = requestAnimationFrame(lockTick);
+  function freezeList(el) {
+    if (!topAccessor || !el || frozenEl === el) return;
+    unfreezeList();
+    frozenEl = el;
+    Object.defineProperty(el, 'scrollTop', {
+      configurable: true,
+      get() { return topAccessor.get.call(this); },
+      set() {},
+    });
+    // scrollTo/scrollBy 也是站点滚到底的入口，一并挡住。
+    el.scrollTo = () => {};
+    el.scrollBy = () => {};
   }
 
-  function startLock() {
-    if (!scroller || atBottom(scroller)) return;
-    lockTop = scroller.scrollTop;
-    if (!scrollLocked) {
-      scrollLocked = true;
-      if (!lockRaf) lockRaf = requestAnimationFrame(lockTick);
-    }
+  function unfreezeList() {
+    const el = frozenEl;
+    frozenEl = null;
+    if (!el) return;
+    delete el.scrollTop;
+    delete el.scrollTo;
+    delete el.scrollBy;
   }
 
   function bindScroller() {
     const el = chatScroller();
     if (!el || el === scroller) return;
+    if (frozenEl && frozenEl !== el) unfreezeList();
     scroller = el;
-    el.addEventListener('wheel', () => {
-      userScrollUntil = Date.now() + 250;
-      startLock();
-    }, { passive: true });
+    el.addEventListener('wheel', event => {
+      lastDir = Math.sign(event.deltaY);
+      if (el.scrollHeight <= el.clientHeight + 4) return;
+      // 本来就往下滚/已在底部时保持自动跟随，其余情况先冻住。
+      if (event.deltaY > 0 && atBottom(el)) return;
+      freezeList(el);
+    }, { passive: true, capture: true });
     el.addEventListener('touchmove', () => {
-      userScrollUntil = Date.now() + 300;
-      startLock();
-    }, { passive: true });
-    el.addEventListener('pointerdown', () => {
-      pointerHeld = true;
-      userScrollUntil = Date.now() + 400;
-      startLock();
-    }, { passive: true });
+      if (!atBottom(el)) freezeList(el);
+    }, { passive: true, capture: true });
     el.addEventListener('scroll', () => {
-      // 拖滚动条时 pointerup 前一直算用户操作，别把位置抢回去。
-      if (pointerHeld) userScrollUntil = Date.now() + 300;
-      if (Date.now() < userScrollUntil) startLock();
+      // 冻结期间站点写不进 scrollTop，能滚动只可能是用户在滚；
+      // 往下滚回底部才解冻，避免往上滚一点点就被站点拉回去。
+      if (frozenEl === el && atBottom(el) && lastDir >= 0) unfreezeList();
     }, { passive: true });
   }
 
