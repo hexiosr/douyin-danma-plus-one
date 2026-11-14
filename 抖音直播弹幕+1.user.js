@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音直播弹幕 +1
 // @namespace    https://github.com/hexiosr/douyin-danma-plus-one
-// @version      1.1.4
+// @version      1.1.5
 // @description  在抖音直播聊天列表的每条弹幕旁加一个 +1，点击后发送相同内容
 // @license      MIT
 // @icon         https://cdn.jsdelivr.net/gh/hexiosr/douyin-danma-plus-one@main/icon.png
@@ -225,9 +225,9 @@
       takeSamples(el);
     }
     lastFrozenSt = topAccessor.get.call(el);
+    placeBottomBtn();
     if (!restore) toast('已暂停滚动');
     startPauseWatch();
-    placeBottomBtn();
   }
 
   function startPauseWatch() {
@@ -532,6 +532,9 @@
       });
       (document.fullscreenElement || document.documentElement).appendChild(toastEl);
     }
+    // 「回到底部」按钮常驻右下角，提示让到它上方，避免叠在一起。
+    const btn = bottomBtn && bottomBtn.style.display !== 'none' ? bottomBtn.getBoundingClientRect() : null;
+    toastEl.style.bottom = btn ? `${Math.round(innerHeight - btn.top + 8)}px` : '96px';
     toastEl.textContent = text;
     toastEl.style.opacity = '1';
     clearTimeout(toastTimer);
