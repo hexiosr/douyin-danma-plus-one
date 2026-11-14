@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音直播弹幕 +1
 // @namespace    https://github.com/hexiosr/douyin-danma-plus-one
-// @version      1.1.0
+// @version      1.1.1
 // @description  在抖音直播聊天列表的每条弹幕旁加一个 +1，点击后发送相同内容
 // @license      MIT
 // @icon         https://cdn.jsdelivr.net/gh/hexiosr/douyin-danma-plus-one@main/icon.png
@@ -123,6 +123,42 @@
   let scroller = null;
   let frozenEl = null;
   let lastDir = 0;
+  let bottomBtn = null;
+
+  function ensureBottomBtn() {
+    if (bottomBtn?.isConnected) return bottomBtn;
+    bottomBtn = document.createElement('button');
+    bottomBtn.type = 'button';
+    bottomBtn.textContent = '回到底部';
+    bottomBtn.title = '恢复自动滚动';
+    Object.assign(bottomBtn.style, {
+      position: 'fixed', zIndex: '2147483000', display: 'none',
+      padding: '4px 10px', border: '1px solid rgba(255,255,255,.28)', borderRadius: '999px',
+      background: 'rgba(28,29,38,.9)', color: '#f5f6fa', cursor: 'pointer',
+      font: '12px/18px system-ui,-apple-system,"Microsoft YaHei",sans-serif',
+    });
+    bottomBtn.addEventListener('pointerdown', event => event.stopPropagation());
+    bottomBtn.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopPropagation();
+      const el = frozenEl;
+      unfreezeList();
+      if (el) el.scrollTop = el.scrollHeight;
+    });
+    (document.fullscreenElement || document.documentElement).appendChild(bottomBtn);
+    return bottomBtn;
+  }
+
+  function placeBottomBtn() {
+    if (!frozenEl) return;
+    const btn = ensureBottomBtn();
+    const rect = frozenEl.getBoundingClientRect();
+    btn.style.right = `${Math.max(10, Math.round(innerWidth - rect.right + 10))}px`;
+    btn.style.bottom = `${Math.max(10, Math.round(innerHeight - rect.bottom + 10))}px`;
+    btn.style.display = 'block';
+  }
+
+  window.addEventListener('resize', () => { if (frozenEl) placeBottomBtn(); });
 
   window.addEventListener('pointerup', () => {
     if (frozenEl && atBottom(frozenEl)) unfreezeList();
@@ -157,11 +193,13 @@
     // scrollTo/scrollBy 也是站点滚到底的入口，一并挡住。
     el.scrollTo = () => {};
     el.scrollBy = () => {};
+    placeBottomBtn();
   }
 
   function unfreezeList() {
     const el = frozenEl;
     frozenEl = null;
+    if (bottomBtn) bottomBtn.style.display = 'none';
     if (!el) return;
     delete el.scrollTop;
     delete el.scrollTo;
@@ -192,6 +230,20 @@
 
   bindScroller();
   setInterval(bindScroller, 1500);
+
+  // 抖音自己的「N 条新消息」按钮：先解冻，站点滚到底才生效。
+  document.addEventListener('click', event => {
+    if (!frozenEl) return;
+    const target = event.target instanceof Element ? event.target : null;
+    const room = target?.closest('.webcast-chatroom');
+    if (!room) return;
+    for (let el = target, i = 0; el && el !== room && i < 5; i++, el = el.parentElement) {
+      if (/^(\d+\s*条|有)?新消息$/.test((el.textContent || '').trim())) {
+        unfreezeList();
+        return;
+      }
+    }
+  }, true);
 
   function findEditor() {
     for (const scope of [...document.querySelectorAll('#chatInput')].filter(isVisible)) {
@@ -304,6 +356,10 @@
   }
   document.addEventListener('fullscreenchange', () => {
     if (toastEl) (document.fullscreenElement || document.documentElement).appendChild(toastEl);
+    if (frozenEl) {
+      if (bottomBtn) (document.fullscreenElement || document.documentElement).appendChild(bottomBtn);
+      placeBottomBtn();
+    }
   });
 
   let busy = false;
