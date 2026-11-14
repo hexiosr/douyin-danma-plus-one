@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音直播弹幕 +1
 // @namespace    https://github.com/hexiosr/douyin-danma-plus-one
-// @version      1.2.0
+// @version      1.2.1
 // @description  在抖音直播聊天列表的每条弹幕旁加一个 +1，点击后发送相同内容
 // @license      MIT
 // @icon         https://cdn.jsdelivr.net/gh/hexiosr/douyin-danma-plus-one@main/icon.png
@@ -123,8 +123,8 @@
     .observe(document.documentElement, { childList: true, subtree: true, characterData: true });
 
   // 抖音会把新弹幕继续渲进可视区，锁 scrollTop 拦不住内容本身的变化。
-  // 上翻时改为把当前列表整块克隆一份盖在原位置，原列表藏起来继续跟到底；
-  // 用户看到的是静止快照，点「回到底部」再撤掉快照。
+  // 所以滚动时照常走实时列表，停手后再把当前列表克隆一份盖在原位，
+  // 原列表藏起来继续跟到底；用户看到的是静止快照，继续滚动时再交回实时列表。
   const OVERLAY_CLASS = 'dy-plus-one-snapshot';
   const HIDDEN_CLASS = 'dy-plus-one-hidden';
   let scroller = null;
@@ -132,6 +132,8 @@
   let overlay = null;
   let frozenHref = '';
   let bottomBtn = null;
+  let idleTimer = 0;
+  let pointerHeld = false;
 
   function inOverlay(node) {
     return node instanceof Element && !!node.closest(`.${OVERLAY_CLASS}`);
@@ -151,8 +153,22 @@
     (document.head || document.documentElement).appendChild(style);
   }
 
-  // deltaY 是本次滚轮的位移，克隆时一并带上，画面不会比手慢一拍。
-  function freezeSnapshot(el, deltaY) {
+  // 用户停手后给当前画面拍快照；滚动过程中仍然走实时列表，历史弹幕照常加载。
+  function noteScrollActivity() {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      if (overlay || pointerHeld) return;
+      const el = scroller;
+      if (!el || !el.isConnected) return;
+      if (el.scrollHeight <= el.clientHeight + 4 || atBottom(el)) return;
+      // 正在选中弹幕准备复制时别拍快照，否则选区会丢。
+      const selection = getSelection();
+      if (selection && !selection.isCollapsed && el.contains(selection.anchorNode)) return;
+      freezeSnapshot(el);
+    }, 300);
+  }
+
+  function freezeSnapshot(el) {
     if (overlay || !el || !el.isConnected) return;
     const rect = el.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
@@ -205,7 +221,7 @@
       });
     });
 
-    clone.scrollTop = clampTop(clone, el.scrollTop + (deltaY || 0));
+    clone.scrollTop = clampTop(clone, el.scrollTop);
     const prevVisibility = el.style.getPropertyValue('visibility');
     const prevPriority = el.style.getPropertyPriority('visibility');
     el.classList.add(HIDDEN_CLASS);
@@ -214,19 +230,20 @@
     frozenEl = el;
     frozenHref = location.href;
     placeBottomBtn();
-    toast('已暂停滚动');
 
-    // 快照滚到底再往下滚，说明用户想回到实时弹幕。
+    // 在快照上继续滚，说明还要往前翻：交回实时列表，让站点照常加载更早的弹幕。
     clone.addEventListener('wheel', event => {
       if (overlay?.clone !== clone) return;
-      if (event.deltaY > 0 && atBottom(clone)) unfreezeSnapshot();
-    }, { passive: true });
+      event.preventDefault();
+      handBack(clone.scrollTop + event.deltaY);
+    }, { passive: false });
     clone.addEventListener('touchend', () => {
       if (overlay?.clone === clone && atBottom(clone)) unfreezeSnapshot();
     }, { passive: true });
   }
 
-  function unfreezeSnapshot() {
+  // 撤掉快照并把实时列表滚到指定位置，后续滚动重新走实时列表。
+  function handBack(targetTop) {
     if (!overlay) return;
     const { box, el, prevVisibility, prevPriority } = overlay;
     box.remove();
@@ -236,10 +253,15 @@
       el.classList.remove(HIDDEN_CLASS);
       if (prevVisibility) el.style.setProperty('visibility', prevVisibility, prevPriority);
       else el.style.removeProperty('visibility');
-      el.scrollTop = el.scrollHeight;
+      el.scrollTop = clampTop(el, targetTop);
     }
     frozenEl = null;
-    bindScroller();
+    noteScrollActivity();
+  }
+
+  function unfreezeSnapshot() {
+    const el = overlay?.el;
+    handBack(el ? el.scrollHeight : 0);
   }
 
   function placeOverlay() {
@@ -323,26 +345,31 @@
   // 事件统一在 document 捕获阶段处理：抖音自己会拦滚轮事件，挂在列表上不保险。
   function onWheel(event) {
     const el = scrollerFor(event.target);
-    if (!el) return; // 快照里的滚动交给快照自己
+    if (!el) return; // 快照里的滚动由快照自己交回实时列表
     scroller = el;
     if (el.scrollHeight <= el.clientHeight + 4) return;
-    // 在底部继续往下滚就是回到实时弹幕；其余情况给当前画面拍快照。
-    if (event.deltaY > 0 && atBottom(el)) { if (overlay) unfreezeSnapshot(); return; }
-    if (!overlay || overlay.el !== el) freezeSnapshot(el, event.deltaY);
+    if (event.deltaY > 0 && atBottom(el)) { clearTimeout(idleTimer); return; }
+    noteScrollActivity();
   }
 
-  // 触屏拖动过程中不拍快照，松手后按停下的位置拍。
+  // 触屏同样松手后再拍快照。
   function onTouchEnd(event) {
     if (overlay) return;
     const el = scrollerFor(event.target);
     if (!el) return;
     scroller = el;
     if (el.scrollHeight <= el.clientHeight + 4 || atBottom(el)) return;
-    freezeSnapshot(el, 0);
+    noteScrollActivity();
   }
 
   document.addEventListener('wheel', onWheel, { passive: true, capture: true });
   document.addEventListener('touchend', onTouchEnd, { passive: true, capture: true });
+  document.addEventListener('pointerdown', () => {
+    pointerHeld = true;
+    clearTimeout(idleTimer);
+  }, { passive: true, capture: true });
+  document.addEventListener('pointerup', () => { pointerHeld = false; }, { passive: true, capture: true });
+  document.addEventListener('pointercancel', () => { pointerHeld = false; }, { passive: true, capture: true });
 
   bindScroller();
   setInterval(() => {
