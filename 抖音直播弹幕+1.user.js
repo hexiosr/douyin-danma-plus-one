@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音直播弹幕 +1
 // @namespace    https://github.com/hexiosr/douyin-danma-plus-one
-// @version      1.1.2
+// @version      1.1.3
 // @description  在抖音直播聊天列表的每条弹幕旁加一个 +1，点击后发送相同内容
 // @license      MIT
 // @icon         https://cdn.jsdelivr.net/gh/hexiosr/douyin-danma-plus-one@main/icon.png
@@ -109,23 +109,149 @@
   }
 
   function scheduleSync() {
-    clearTimeout(chipTimer);
-    // 列表节点可能被抖音整块替换，顺便重新绑定滚动容器。
-    chipTimer = setTimeout(() => { bindScroller(); syncChips(); }, 150);
+    // 弹幕密集时 mutation 几乎不停，用节流保证 +1 按钮持续补上。
+    if (chipTimer) return;
+    chipTimer = setTimeout(() => {
+      chipTimer = 0;
+      bindScroller();
+      syncChips();
+    }, 120);
   }
 
   syncChips();
   new MutationObserver(scheduleSync)
     .observe(document.documentElement, { childList: true, subtree: true, characterData: true });
 
-  // 抖音在滚动后会把聊天列表写回底部，拦不住事件就冻住元素自己的 scrollTop 赋值：
-  // 用户往上翻后位置定住，翻回底部再解冻，恢复新弹幕自动跟随。
+  // 抖音在滚动后会把聊天列表写回底部。用户往上翻后冻住列表自身的 scrollTop 赋值；
+  // 弹幕多时列表会回收/重排节点，这里再按画面里的弹幕把位置拉回来。
   const topAccessor = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
   let scroller = null;
   let frozenEl = null;
+  let paused = false;
   let lastDir = 0;
   let pointerHeld = false;
+  let lastUserInput = 0;
+  let pauseTimer = 0;
+  let samples = [];
+  let lastFrozenSt = 0;
+  let frozenHref = '';
   let bottomBtn = null;
+
+  function itemEntries(el) {
+    return [...el.querySelectorAll(ITEM_SELECTOR)].map(item => ({
+      item,
+      key: messageText(item) || textOf(item),
+    }));
+  }
+
+  // 记录视口内的弹幕和位置，冻结期间当作锚点。
+  function takeSamples(el) {
+    samples = [];
+    const top = el.getBoundingClientRect().top;
+    const height = el.clientHeight;
+    for (const { item, key } of itemEntries(el)) {
+      if (!key) continue;
+      const rect = item.getBoundingClientRect();
+      const off = rect.top - top;
+      if (rect.height && off + rect.height > 0 && off < height) samples.push({ key, off });
+    }
+  }
+
+  function clampTop(el, value) {
+    return Math.max(0, Math.min(value, Math.max(0, el.scrollHeight - el.clientHeight)));
+  }
+
+  // 把最早还在视口里的锚点弹幕挪回冻结时的位置，返回是否找到锚点。
+  function alignView(el) {
+    const top = el.getBoundingClientRect().top;
+    const entries = itemEntries(el);
+    for (const sample of samples) {
+      let best = null;
+      let bestGap = Infinity;
+      for (const { item, key } of entries) {
+        if (key !== sample.key) continue;
+        const gap = Math.abs(item.getBoundingClientRect().top - top - sample.off);
+        if (gap < bestGap) { bestGap = gap; best = item; }
+      }
+      if (!best) continue;
+      const delta = (best.getBoundingClientRect().top - top) - sample.off;
+      if (Math.abs(delta) >= 4 && Math.abs(delta) < el.clientHeight) {
+        topAccessor.set.call(el, clampTop(el, topAccessor.get.call(el) + delta));
+      }
+      return true;
+    }
+    return false;
+  }
+
+  function releaseFreeze(el) {
+    delete el.scrollTop;
+    delete el.scrollTo;
+    delete el.scrollBy;
+  }
+
+  function freezeList(el, restore) {
+    if (!topAccessor || !el || !el.isConnected) return;
+    if (frozenEl === el) { paused = true; return; }
+    const prevSt = frozenEl ? (frozenEl.isConnected ? topAccessor.get.call(frozenEl) : lastFrozenSt) : lastFrozenSt;
+    if (frozenEl) releaseFreeze(frozenEl);
+    frozenEl = el;
+    paused = true;
+    frozenHref = location.href;
+    Object.defineProperty(el, 'scrollTop', {
+      configurable: true,
+      get() { return topAccessor.get.call(this); },
+      set() {},
+    });
+    // scrollTo/scrollBy 也是站点滚到底的入口，一并挡住。
+    el.scrollTo = () => {};
+    el.scrollBy = () => {};
+    const kept = restore && alignView(el);
+    if (!kept) {
+      if (restore) topAccessor.set.call(el, clampTop(el, prevSt));
+      takeSamples(el);
+    }
+    lastFrozenSt = topAccessor.get.call(el);
+    startPauseWatch();
+    placeBottomBtn();
+  }
+
+  function startPauseWatch() {
+    if (pauseTimer) return;
+    // 用户停手后每 250ms 校对一次画面，防止列表回收把正在看的弹幕带走。
+    pauseTimer = setInterval(() => {
+      if (!paused) return;
+      if (location.href !== frozenHref) { unfreezeList(); return; }
+      const el = frozenEl;
+      if (!el || !el.isConnected) {
+        const next = scroller && scroller.isConnected ? scroller : chatScroller();
+        if (next) { scroller = next; freezeList(next, true); }
+        return;
+      }
+      // 用户还在滚，按当前画面更新锚点，等停下来再钉住。
+      if (Date.now() - lastUserInput < 400) {
+        takeSamples(el);
+        lastFrozenSt = topAccessor.get.call(el);
+        return;
+      }
+      if (!alignView(el)) takeSamples(el);
+      lastFrozenSt = topAccessor.get.call(el);
+    }, 250);
+  }
+
+  function stopPauseWatch() {
+    clearInterval(pauseTimer);
+    pauseTimer = 0;
+  }
+
+  function unfreezeList() {
+    paused = false;
+    samples = [];
+    stopPauseWatch();
+    if (bottomBtn) bottomBtn.style.display = 'none';
+    const el = frozenEl;
+    frozenEl = null;
+    if (el) releaseFreeze(el);
+  }
 
   function ensureBottomBtn() {
     if (bottomBtn?.isConnected) return bottomBtn;
@@ -162,108 +288,99 @@
 
   window.addEventListener('resize', () => { if (frozenEl) placeBottomBtn(); });
 
-  window.addEventListener('pointerup', () => {
-    if (frozenEl && atBottom(frozenEl)) unfreezeList();
-  }, { passive: true, capture: true });
+  // 从事件目标往上找真正在滚的聊天容器，页面换布局也不会失去绑定。
+  function scrollableFrom(node) {
+    let el = node instanceof Element ? node : node && node.parentElement;
+    for (; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+      if (/(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY) &&
+          el.scrollHeight > el.clientHeight + 4 && el.querySelector(ITEM_SELECTOR)) return el;
+    }
+    return null;
+  }
+
+  function scrollerFor(node) {
+    if (scroller && scroller.isConnected && node instanceof Node && scroller.contains(node)) return scroller;
+    return scrollableFrom(node);
+  }
 
   function chatScroller() {
     const list = [...document.querySelectorAll('.webcast-chatroom___list')]
       .find(el => el.querySelector(ITEM_SELECTOR) && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY));
-    if (list) return list;
-    let el = document.querySelector(ITEM_SELECTOR)?.parentElement;
-    while (el && el !== document.body) {
-      const style = getComputedStyle(el);
-      if (/(auto|scroll|overlay)/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 10) return el;
-      el = el.parentElement;
-    }
-    return null;
+    return list || scrollableFrom(document.querySelector(ITEM_SELECTOR));
   }
 
   function atBottom(el) {
     return el.scrollHeight - el.scrollTop - el.clientHeight < 8;
   }
 
-  function freezeList(el) {
-    if (!topAccessor || !el || frozenEl === el) return;
-    unfreezeList();
-    frozenEl = el;
-    Object.defineProperty(el, 'scrollTop', {
-      configurable: true,
-      get() { return topAccessor.get.call(this); },
-      set() {},
-    });
-    // scrollTo/scrollBy 也是站点滚到底的入口，一并挡住。
-    el.scrollTo = () => {};
-    el.scrollBy = () => {};
-    placeBottomBtn();
-  }
-
-  function unfreezeList() {
-    const el = frozenEl;
-    frozenEl = null;
-    if (bottomBtn) bottomBtn.style.display = 'none';
-    if (!el) return;
-    delete el.scrollTop;
-    delete el.scrollTo;
-    delete el.scrollBy;
-  }
-
   function bindScroller() {
     const el = chatScroller();
     if (!el) return;
-    if (el !== scroller) {
-      scroller = el;
-      lastDir = 0;
-    }
-    if (frozenEl && (!frozenEl.isConnected || frozenEl !== el)) unfreezeList();
+    scroller = el;
+    // 列表节点被整块换掉时，接着冻新节点并尽量回到原画面。
+    if (paused && (!frozenEl || !frozenEl.isConnected)) freezeList(el, true);
   }
 
   // 事件统一在 document 捕获阶段处理：抖音自己会拦滚轮事件，挂在列表上不保险。
   function onWheel(event) {
-    const el = scroller;
-    if (!el || !el.isConnected) return;
-    if (!(event.target instanceof Node) || !el.contains(event.target)) return;
+    const el = scrollerFor(event.target);
+    if (!el) return;
+    scroller = el;
     lastDir = Math.sign(event.deltaY);
+    lastUserInput = Date.now();
     if (el.scrollHeight <= el.clientHeight + 4) return;
-    // 本来就往下滚/已在底部时保持自动跟随，其余情况先冻住。
-    if (event.deltaY > 0 && atBottom(el)) return;
-    freezeList(el);
+    // 在底部继续往下滚时恢复自动跟随，其余情况先冻住。
+    if (event.deltaY > 0 && atBottom(el)) { if (paused) unfreezeList(); return; }
+    if (frozenEl !== el) freezeList(el, false);
+    else paused = true;
   }
 
   function onTouchMove(event) {
-    const el = scroller;
-    if (!el || !el.isConnected || frozenEl === el) return;
-    if (!(event.target instanceof Node) || !el.contains(event.target)) return;
+    const el = scrollerFor(event.target);
+    if (!el) return;
+    scroller = el;
+    lastUserInput = Date.now();
     if (el.scrollHeight <= el.clientHeight + 4 || atBottom(el)) return;
-    freezeList(el);
+    if (frozenEl !== el) freezeList(el, false);
   }
 
   function onPointerDown(event) {
-    const el = scroller;
-    if (!el || !el.isConnected || !(event.target instanceof Node) || !el.contains(event.target)) return;
+    if (!(event.target instanceof Node)) return;
     pointerHeld = true;
+    lastUserInput = Date.now();
+    const el = scrollerFor(event.target);
+    if (!el) return;
+    scroller = el;
     if (event.target !== el) return;
     // 点在滚动条/列表空白处时目标是列表本身，说明用户在手动拖动。
     if (el.scrollHeight <= el.clientHeight + 4 || atBottom(el)) return;
-    freezeList(el);
+    if (frozenEl !== el) freezeList(el, false);
+  }
+
+  function onPointerMove() {
+    if (pointerHeld) lastUserInput = Date.now();
   }
 
   function onListScroll(event) {
-    const el = scroller;
-    if (!el || event.target !== el) return;
-    if (atBottom(el)) {
-      // 冻结期间站点写不进 scrollTop，能滚到底只可能是用户在滚。
-      if (frozenEl === el && (pointerHeld || lastDir >= 0)) unfreezeList();
-      return;
-    }
-    // 拖滚动条时按滚动实时判断，不依赖滚轮。
-    if (frozenEl !== el && pointerHeld && el.scrollHeight > el.clientHeight + 4) freezeList(el);
+    const el = frozenEl;
+    if (!paused || !el || event.target !== el) return;
+    if (pointerHeld) lastUserInput = Date.now();
+    if (!atBottom(el)) return;
+    // 冻结期间站点写不进 scrollTop，滚到底只可能是用户自己在往下翻。
+    if (pointerHeld || (lastDir > 0 && Date.now() - lastUserInput < 600)) unfreezeList();
+  }
+
+  function onKey(event) {
+    if (!paused) return;
+    if (/^(PageUp|PageDown|ArrowUp|ArrowDown|Home|End| )$/.test(event.key)) lastUserInput = Date.now();
   }
 
   document.addEventListener('wheel', onWheel, { passive: true, capture: true });
   document.addEventListener('touchmove', onTouchMove, { passive: true, capture: true });
   document.addEventListener('pointerdown', onPointerDown, { passive: true, capture: true });
+  document.addEventListener('pointermove', onPointerMove, { passive: true, capture: true });
   document.addEventListener('scroll', onListScroll, { passive: true, capture: true });
+  document.addEventListener('keydown', onKey, { passive: true, capture: true });
   window.addEventListener('pointerup', () => { pointerHeld = false; }, { passive: true, capture: true });
   window.addEventListener('pointercancel', () => { pointerHeld = false; }, { passive: true, capture: true });
 
