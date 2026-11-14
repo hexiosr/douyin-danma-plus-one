@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音直播弹幕 +1
 // @namespace    https://github.com/hexiosr/douyin-danma-plus-one
-// @version      1.1.1
+// @version      1.1.2
 // @description  在抖音直播聊天列表的每条弹幕旁加一个 +1，点击后发送相同内容
 // @license      MIT
 // @icon         https://cdn.jsdelivr.net/gh/hexiosr/douyin-danma-plus-one@main/icon.png
@@ -110,7 +110,8 @@
 
   function scheduleSync() {
     clearTimeout(chipTimer);
-    chipTimer = setTimeout(syncChips, 150);
+    // 列表节点可能被抖音整块替换，顺便重新绑定滚动容器。
+    chipTimer = setTimeout(() => { bindScroller(); syncChips(); }, 150);
   }
 
   syncChips();
@@ -123,6 +124,7 @@
   let scroller = null;
   let frozenEl = null;
   let lastDir = 0;
+  let pointerHeld = false;
   let bottomBtn = null;
 
   function ensureBottomBtn() {
@@ -208,25 +210,62 @@
 
   function bindScroller() {
     const el = chatScroller();
-    if (!el || el === scroller) return;
-    if (frozenEl && frozenEl !== el) unfreezeList();
-    scroller = el;
-    el.addEventListener('wheel', event => {
-      lastDir = Math.sign(event.deltaY);
-      if (el.scrollHeight <= el.clientHeight + 4) return;
-      // 本来就往下滚/已在底部时保持自动跟随，其余情况先冻住。
-      if (event.deltaY > 0 && atBottom(el)) return;
-      freezeList(el);
-    }, { passive: true, capture: true });
-    el.addEventListener('touchmove', () => {
-      if (!atBottom(el)) freezeList(el);
-    }, { passive: true, capture: true });
-    el.addEventListener('scroll', () => {
-      // 冻结期间站点写不进 scrollTop，能滚动只可能是用户在滚；
-      // 往下滚回底部才解冻，避免往上滚一点点就被站点拉回去。
-      if (frozenEl === el && atBottom(el) && lastDir >= 0) unfreezeList();
-    }, { passive: true });
+    if (!el) return;
+    if (el !== scroller) {
+      scroller = el;
+      lastDir = 0;
+    }
+    if (frozenEl && (!frozenEl.isConnected || frozenEl !== el)) unfreezeList();
   }
+
+  // 事件统一在 document 捕获阶段处理：抖音自己会拦滚轮事件，挂在列表上不保险。
+  function onWheel(event) {
+    const el = scroller;
+    if (!el || !el.isConnected) return;
+    if (!(event.target instanceof Node) || !el.contains(event.target)) return;
+    lastDir = Math.sign(event.deltaY);
+    if (el.scrollHeight <= el.clientHeight + 4) return;
+    // 本来就往下滚/已在底部时保持自动跟随，其余情况先冻住。
+    if (event.deltaY > 0 && atBottom(el)) return;
+    freezeList(el);
+  }
+
+  function onTouchMove(event) {
+    const el = scroller;
+    if (!el || !el.isConnected || frozenEl === el) return;
+    if (!(event.target instanceof Node) || !el.contains(event.target)) return;
+    if (el.scrollHeight <= el.clientHeight + 4 || atBottom(el)) return;
+    freezeList(el);
+  }
+
+  function onPointerDown(event) {
+    const el = scroller;
+    if (!el || !el.isConnected || !(event.target instanceof Node) || !el.contains(event.target)) return;
+    pointerHeld = true;
+    if (event.target !== el) return;
+    // 点在滚动条/列表空白处时目标是列表本身，说明用户在手动拖动。
+    if (el.scrollHeight <= el.clientHeight + 4 || atBottom(el)) return;
+    freezeList(el);
+  }
+
+  function onListScroll(event) {
+    const el = scroller;
+    if (!el || event.target !== el) return;
+    if (atBottom(el)) {
+      // 冻结期间站点写不进 scrollTop，能滚到底只可能是用户在滚。
+      if (frozenEl === el && (pointerHeld || lastDir >= 0)) unfreezeList();
+      return;
+    }
+    // 拖滚动条时按滚动实时判断，不依赖滚轮。
+    if (frozenEl !== el && pointerHeld && el.scrollHeight > el.clientHeight + 4) freezeList(el);
+  }
+
+  document.addEventListener('wheel', onWheel, { passive: true, capture: true });
+  document.addEventListener('touchmove', onTouchMove, { passive: true, capture: true });
+  document.addEventListener('pointerdown', onPointerDown, { passive: true, capture: true });
+  document.addEventListener('scroll', onListScroll, { passive: true, capture: true });
+  window.addEventListener('pointerup', () => { pointerHeld = false; }, { passive: true, capture: true });
+  window.addEventListener('pointercancel', () => { pointerHeld = false; }, { passive: true, capture: true });
 
   bindScroller();
   setInterval(bindScroller, 1500);
