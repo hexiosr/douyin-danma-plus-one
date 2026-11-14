@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音直播弹幕 +1
 // @namespace    https://github.com/hexiosr/douyin-danma-plus-one
-// @version      1.0.9
+// @version      1.1.0
 // @description  在抖音直播聊天列表的每条弹幕旁加一个 +1，点击后发送相同内容
 // @license      MIT
 // @icon         https://cdn.jsdelivr.net/gh/hexiosr/douyin-danma-plus-one@main/icon.png
@@ -24,6 +24,7 @@
   const SEND_SELECTOR = ".webcast-chatroom___send-btn, [data-e2e='chat-send-btn'], [class*='send-btn'], [class*='sendBtn'], [class*='send_btn']";
   const SYSTEM_TEXT = /^(来了|为主播点赞了|关注了主播|加入了直播间|分享了直播间|送出)/;
   const MAX_TEXT = 500;
+  const CHIP_CLASS = 'dy-plus-one-chip';
 
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -32,6 +33,7 @@
     const walk = n => {
       if (n.nodeType === 3) { out += n.nodeValue || ''; return; }
       if (n.nodeType !== 1) return;
+      if (n.classList?.contains('dy-plus-one-chip')) return;
       if (n.tagName === 'IMG') { out += n.getAttribute('alt') || ''; return; }
       if (/^(SCRIPT|STYLE|SVG|NOSCRIPT)$/.test(n.tagName)) return;
       for (const child of n.childNodes) walk(child);
@@ -69,125 +71,51 @@
     return text;
   }
 
-  const CARD_STYLE = {
-    position: 'fixed', zIndex: '2147483000', boxSizing: 'border-box',
-    display: 'none', alignItems: 'center', gap: '8px',
-    padding: '4px 6px 4px 10px', borderRadius: '8px',
-    background: '#15161d', border: '1px solid #3c3e4d',
-    boxShadow: '0 6px 18px rgba(0,0,0,.5)',
-    color: '#f5f6fa', font: '13px/1.4 system-ui,-apple-system,"Microsoft YaHei",sans-serif',
-    // 卡片本体不吃鼠标，滚轮、点击都从卡片穿过去，只留 +1 按钮可点。
-    pointerEvents: 'none',
-  };
+  let chipTimer = 0;
 
-  let card = null;
-  let cardText = '';
-  let cardItem = null;
-  let hideTimer = 0;
-  let hoverTimer = 0;
-
-  function ensureCard() {
-    if (card?.isConnected) return card;
-    card = document.createElement('div');
-    card.className = 'dy-plus-one-card';
-    Object.assign(card.style, CARD_STYLE);
-    const label = document.createElement('span');
-    label.className = 'dy-plus-one-card-text';
-    Object.assign(label.style, {
-      flex: '1', minWidth: '0', whiteSpace: 'normal', overflowWrap: 'anywhere',
-    });
+  // 每条普通弹幕行末尾插一个内联 +1，不再用遮住昵称的浮层。
+  function ensureChip(item) {
+    const text = messageText(item);
+    const line = item.querySelector('.webcast-chatroom___item-wrapper')?.firstElementChild || item.firstElementChild;
+    const existing = item.querySelector(`.${CHIP_CLASS}`);
+    if (!text || !line) { existing?.remove(); return; }
+    if (existing) return;
     const btn = document.createElement('button');
     btn.type = 'button';
+    btn.className = CHIP_CLASS;
     btn.textContent = '+1';
     btn.title = '发送相同弹幕';
     btn.setAttribute('aria-label', '发送相同弹幕');
     Object.assign(btn.style, {
-      flex: 'none', padding: '0 7px', border: '0', borderRadius: '10px',
-      background: '#fe2c55', color: '#fff', cursor: 'pointer', pointerEvents: 'auto',
-      font: '600 11px/20px system-ui,-apple-system,"Microsoft YaHei",sans-serif',
+      display: 'inline-flex', alignItems: 'center', flex: 'none',
+      margin: '0 0 0 6px', padding: '0 5px', border: '0', borderRadius: '8px',
+      background: 'rgba(254,44,85,.92)', color: '#fff', cursor: 'pointer',
+      font: '600 10px/16px system-ui,-apple-system,"Microsoft YaHei",sans-serif',
+      verticalAlign: 'middle',
     });
     btn.addEventListener('pointerdown', event => event.stopPropagation());
     btn.addEventListener('click', event => {
       event.preventDefault();
       event.stopPropagation();
-      if (cardText) sendPlusOne(cardText, btn);
+      // 节点可能被列表回收改成别的弹幕，点的时候重新读一次。
+      const current = messageText(item);
+      if (current) sendPlusOne(current, btn);
     });
-    card.append(label, btn);
-    (document.fullscreenElement || document.documentElement).appendChild(card);
-    return card;
+    line.appendChild(btn);
   }
 
-  // 把悬停的弹幕定格成一张 fixed 卡片，列表怎么滚它都不动，+1 一定点得到。
-  function showCard(item) {
-    const text = messageText(item);
-    const rect = item.getBoundingClientRect();
-    if (!text || !rect.width || !rect.height) return;
-    const el = ensureCard();
-    clearTimeout(hideTimer);
-    cardText = text;
-    cardItem = item;
-    el.querySelector('.dy-plus-one-card-text').textContent = text;
-    el.style.left = `${Math.max(0, rect.left - 2)}px`;
-    el.style.top = `${Math.max(0, rect.top - 2)}px`;
-    el.style.width = `${rect.width + 4}px`;
-    el.style.minHeight = `${rect.height + 4}px`;
-    el.style.display = 'flex';
-    // 长弹幕换行后卡片会变高，掉出视口底部时整体上移。
-    const height = el.getBoundingClientRect().height;
-    if (rect.top - 2 + height > innerHeight - 6) {
-      el.style.top = `${Math.max(6, innerHeight - 6 - height)}px`;
-    }
+  function syncChips() {
+    for (const item of document.querySelectorAll(ITEM_SELECTOR)) ensureChip(item);
   }
 
-  function hideCardNow() {
-    clearTimeout(hideTimer);
-    if (card) card.style.display = 'none';
-    cardItem = null;
-    cardText = '';
+  function scheduleSync() {
+    clearTimeout(chipTimer);
+    chipTimer = setTimeout(syncChips, 150);
   }
 
-  function hideCardSoon() {
-    clearTimeout(hideTimer);
-    hideTimer = setTimeout(hideCardNow, 150);
-  }
-
-  function cardShown() {
-    return !!card && card.style.display === 'flex';
-  }
-
-  function pointerInCard(event) {
-    if (!cardShown()) return false;
-    const rect = card.getBoundingClientRect();
-    return event.clientX >= rect.left - 8 && event.clientX <= rect.right + 8 &&
-      event.clientY >= rect.top - 8 && event.clientY <= rect.bottom + 8;
-  }
-
-  document.addEventListener('mouseover', event => {
-    clearTimeout(hoverTimer);
-    // 鼠标还停在定格卡片上时，不从下面滚过的弹幕里再抓一条。
-    if (pointerInCard(event)) return;
-    const item = event.target instanceof Element ? event.target.closest(ITEM_SELECTOR) : null;
-    if (!item || item === cardItem) return;
-    // 停留 150ms 再定格，扫过聊天列表时不会到处闪卡片。
-    hoverTimer = setTimeout(() => showCard(item), 150);
-  });
-
-  document.addEventListener('pointermove', event => {
-    if (!cardShown()) return;
-    if (pointerInCard(event)) { clearTimeout(hideTimer); return; }
-    hideCardSoon();
-  });
-
-  // 滚轮直接穿到聊天列表，顺手收起卡片，滚动全程不被打断。
-  document.addEventListener('wheel', () => {
-    clearTimeout(hoverTimer);
-    hideCardNow();
-  }, { passive: true, capture: true });
-
-  document.addEventListener('mouseleave', () => {
-    clearTimeout(hoverTimer);
-    hideCardSoon();
-  });
+  syncChips();
+  new MutationObserver(scheduleSync)
+    .observe(document.documentElement, { childList: true, subtree: true, characterData: true });
 
   // 抖音在滚动后会把聊天列表写回底部，拦不住事件就冻住元素自己的 scrollTop 赋值：
   // 用户往上翻后位置定住，翻回底部再解冻，恢复新弹幕自动跟随。
@@ -375,9 +303,6 @@
     toastTimer = setTimeout(() => { toastEl.style.opacity = '0'; }, 2200);
   }
   document.addEventListener('fullscreenchange', () => {
-    if (card) { card.remove(); card = null; }
-    cardItem = null;
-    cardText = '';
     if (toastEl) (document.fullscreenElement || document.documentElement).appendChild(toastEl);
   });
 
