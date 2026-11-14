@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         抖音直播弹幕 +1
 // @namespace    https://github.com/hexiosr/douyin-danma-plus-one
-// @version      1.1.5
+// @version      1.2.0
 // @description  在抖音直播聊天列表的每条弹幕旁加一个 +1，点击后发送相同内容
 // @license      MIT
 // @icon         https://cdn.jsdelivr.net/gh/hexiosr/douyin-danma-plus-one@main/icon.png
@@ -122,155 +122,135 @@
   new MutationObserver(scheduleSync)
     .observe(document.documentElement, { childList: true, subtree: true, characterData: true });
 
-  // 抖音在滚动后会把聊天列表写回底部。用户往上翻后冻住列表自身的 scrollTop 赋值；
-  // 弹幕多时列表会回收/重排节点，这里再按画面里的弹幕把位置拉回来。
-  const topAccessor = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
+  // 抖音会把新弹幕继续渲进可视区，锁 scrollTop 拦不住内容本身的变化。
+  // 上翻时改为把当前列表整块克隆一份盖在原位置，原列表藏起来继续跟到底；
+  // 用户看到的是静止快照，点「回到底部」再撤掉快照。
+  const OVERLAY_CLASS = 'dy-plus-one-snapshot';
+  const HIDDEN_CLASS = 'dy-plus-one-hidden';
   let scroller = null;
   let frozenEl = null;
-  let paused = false;
-  let lastDir = 0;
-  let pointerHeld = false;
-  let lastUserInput = 0;
-  let pauseRaf = 0;
-  let lastSampleAt = 0;
-  let samples = [];
-  let lastFrozenSt = 0;
+  let overlay = null;
   let frozenHref = '';
   let bottomBtn = null;
 
-  function itemEntries(el) {
-    return [...el.querySelectorAll(ITEM_SELECTOR)].map(item => ({
-      item,
-      key: messageText(item) || textOf(item),
-    }));
-  }
-
-  // 记录视口内的弹幕和位置，冻结期间当作锚点。
-  function takeSamples(el) {
-    samples = [];
-    const top = el.getBoundingClientRect().top;
-    const height = el.clientHeight;
-    for (const { item, key } of itemEntries(el)) {
-      if (!key) continue;
-      const rect = item.getBoundingClientRect();
-      const off = rect.top - top;
-      if (rect.height && off + rect.height > 0 && off < height) samples.push({ key, off, item });
-    }
+  function inOverlay(node) {
+    return node instanceof Element && !!node.closest(`.${OVERLAY_CLASS}`);
   }
 
   function clampTop(el, value) {
     return Math.max(0, Math.min(value, Math.max(0, el.scrollHeight - el.clientHeight)));
   }
 
-  // 把最早还在视口里的锚点弹幕挪回冻结时的位置，返回是否找到锚点。
-  // 走原生 setter，绕过我们自己挡住的赋值；每帧只校一个锚点，开销很小。
-  function alignView(el) {
-    const top = el.getBoundingClientRect().top;
-    for (const sample of samples) {
-      let best = sample.item;
-      if (!best || !best.isConnected || (messageText(best) || textOf(best)) !== sample.key) {
-        best = null;
-        let bestGap = Infinity;
-        for (const { item, key } of itemEntries(el)) {
-          if (key !== sample.key) continue;
-          const gap = Math.abs(item.getBoundingClientRect().top - top - sample.off);
-          if (gap < bestGap) { bestGap = gap; best = item; }
-        }
-        if (!best) continue;
-        sample.item = best;
-      }
-      const delta = (best.getBoundingClientRect().top - top) - sample.off;
-      if (Math.abs(delta) >= 2 && Math.abs(delta) < el.clientHeight) {
-        topAccessor.set.call(el, clampTop(el, topAccessor.get.call(el) + delta));
-      }
-      return true;
-    }
-    return false;
+  function ensureSnapshotStyle() {
+    if (document.getElementById('dy-plus-one-snapshot-style')) return;
+    const style = document.createElement('style');
+    style.id = 'dy-plus-one-snapshot-style';
+    style.textContent = `.${OVERLAY_CLASS},.${OVERLAY_CLASS} *{scrollbar-width:none!important}` +
+      `.${OVERLAY_CLASS}::-webkit-scrollbar{display:none!important}` +
+      `.${HIDDEN_CLASS}{visibility:hidden!important}`;
+    (document.head || document.documentElement).appendChild(style);
   }
 
-  // 站点还可能用 scroll / scrollIntoView 把新弹幕带进视野，这两种原生滚动碰不到 scrollTop。
-  const nativeScrollIntoView = Element.prototype.scrollIntoView;
-  Element.prototype.scrollIntoView = function (...args) {
-    if (paused && frozenEl && frozenEl.contains(this)) return;
-    return nativeScrollIntoView.apply(this, args);
-  };
-
-  function releaseFreeze(el) {
-    delete el.scrollTop;
-    delete el.scrollTo;
-    delete el.scrollBy;
-    delete el.scroll;
-  }
-
-  function freezeList(el, restore) {
-    if (!topAccessor || !el || !el.isConnected) return;
-    if (frozenEl === el) { paused = true; return; }
-    const prevSt = frozenEl ? (frozenEl.isConnected ? topAccessor.get.call(frozenEl) : lastFrozenSt) : lastFrozenSt;
-    if (frozenEl) releaseFreeze(frozenEl);
-    frozenEl = el;
-    paused = true;
-    frozenHref = location.href;
-    Object.defineProperty(el, 'scrollTop', {
-      configurable: true,
-      get() { return topAccessor.get.call(this); },
-      set() {},
+  // deltaY 是本次滚轮的位移，克隆时一并带上，画面不会比手慢一拍。
+  function freezeSnapshot(el, deltaY) {
+    if (overlay || !el || !el.isConnected) return;
+    const rect = el.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    ensureSnapshotStyle();
+    const box = document.createElement('div');
+    box.className = OVERLAY_CLASS;
+    Object.assign(box.style, {
+      position: 'fixed',
+      left: `${rect.left}px`,
+      top: `${rect.top}px`,
+      width: `${rect.width}px`,
+      height: `${rect.height}px`,
+      zIndex: '2147482900',
+      background: 'transparent',
+      margin: '0',
+      padding: '0',
     });
-    // scroll / scrollTo / scrollBy 也是站点滚到底的入口，一并挡住。
-    el.scroll = () => {};
-    el.scrollTo = () => {};
-    el.scrollBy = () => {};
-    const kept = restore && alignView(el);
-    if (!kept) {
-      if (restore) topAccessor.set.call(el, clampTop(el, prevSt));
-      takeSamples(el);
-    }
-    lastFrozenSt = topAccessor.get.call(el);
+    const clone = el.cloneNode(true);
+    clone.removeAttribute('id');
+    Object.assign(clone.style, {
+      width: '100%',
+      height: '100%',
+      margin: '0',
+      overflowY: 'auto',
+      overflowX: 'hidden',
+    });
+    box.appendChild(clone);
+    // 聊天面板的字体和颜色可能挂在祖先上，克隆后补一份。
+    const cs = getComputedStyle(el);
+    box.style.color = cs.color;
+    box.style.font = cs.font;
+    (document.fullscreenElement || document.documentElement).appendChild(box);
+
+    // cloneNode 不带监听，把 +1 重新绑到克隆出来的行上。
+    const liveItems = [...el.querySelectorAll(ITEM_SELECTOR)];
+    const cloneItems = [...clone.querySelectorAll(ITEM_SELECTOR)];
+    cloneItems.forEach((item, index) => {
+      const chip = item.querySelector(`.${CHIP_CLASS}`);
+      if (!chip) return;
+      const source = liveItems[index];
+      const text = source ? messageText(source) : '';
+      if (!text) { chip.remove(); return; }
+      chip.disabled = false;
+      chip.textContent = '+1';
+      chip.addEventListener('pointerdown', event => event.stopPropagation());
+      chip.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        sendPlusOne(text, chip);
+      });
+    });
+
+    clone.scrollTop = clampTop(clone, el.scrollTop + (deltaY || 0));
+    const prevVisibility = el.style.getPropertyValue('visibility');
+    const prevPriority = el.style.getPropertyPriority('visibility');
+    el.classList.add(HIDDEN_CLASS);
+    el.style.setProperty('visibility', 'hidden', 'important');
+    overlay = { box, clone, el, prevVisibility, prevPriority };
+    frozenEl = el;
+    frozenHref = location.href;
     placeBottomBtn();
-    if (!restore) toast('已暂停滚动');
-    startPauseWatch();
+    toast('已暂停滚动');
+
+    // 快照滚到底再往下滚，说明用户想回到实时弹幕。
+    clone.addEventListener('wheel', event => {
+      if (overlay?.clone !== clone) return;
+      if (event.deltaY > 0 && atBottom(clone)) unfreezeSnapshot();
+    }, { passive: true });
+    clone.addEventListener('touchend', () => {
+      if (overlay?.clone === clone && atBottom(clone)) unfreezeSnapshot();
+    }, { passive: true });
   }
 
-  function startPauseWatch() {
-    if (pauseRaf) return;
-    // 逐帧对齐：站点每把列表拉回底部一次，就在同一帧掰回来，看起来是钉住的。
-    const tick = () => {
-      if (!paused) { pauseRaf = 0; return; }
-      pauseRaf = requestAnimationFrame(tick);
-      if (location.href !== frozenHref) { unfreezeList(); return; }
-      const el = frozenEl;
-      if (!el || !el.isConnected) {
-        const next = scroller && scroller.isConnected ? scroller : chatScroller();
-        if (next) { scroller = next; freezeList(next, true); }
-        return;
-      }
-      // 用户还在滚，按当前画面更新锚点，等停下来再钉住。
-      if (Date.now() - lastUserInput < 400) {
-        if (Date.now() - lastSampleAt > 200) {
-          takeSamples(el);
-          lastSampleAt = Date.now();
-        }
-        lastFrozenSt = topAccessor.get.call(el);
-        return;
-      }
-      if (!alignView(el)) takeSamples(el);
-      lastFrozenSt = topAccessor.get.call(el);
-    };
-    pauseRaf = requestAnimationFrame(tick);
-  }
-
-  function stopPauseWatch() {
-    if (pauseRaf) cancelAnimationFrame(pauseRaf);
-    pauseRaf = 0;
-  }
-
-  function unfreezeList() {
-    paused = false;
-    samples = [];
-    stopPauseWatch();
+  function unfreezeSnapshot() {
+    if (!overlay) return;
+    const { box, el, prevVisibility, prevPriority } = overlay;
+    box.remove();
+    overlay = null;
     if (bottomBtn) bottomBtn.style.display = 'none';
-    const el = frozenEl;
+    if (el && el.isConnected) {
+      el.classList.remove(HIDDEN_CLASS);
+      if (prevVisibility) el.style.setProperty('visibility', prevVisibility, prevPriority);
+      else el.style.removeProperty('visibility');
+      el.scrollTop = el.scrollHeight;
+    }
     frozenEl = null;
-    if (el) releaseFreeze(el);
+    bindScroller();
+  }
+
+  function placeOverlay() {
+    if (!overlay || !overlay.el?.isConnected) return;
+    const rect = overlay.el.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const { box } = overlay;
+    box.style.left = `${rect.left}px`;
+    box.style.top = `${rect.top}px`;
+    box.style.width = `${rect.width}px`;
+    box.style.height = `${rect.height}px`;
   }
 
   function ensureBottomBtn() {
@@ -289,9 +269,7 @@
     bottomBtn.addEventListener('click', event => {
       event.preventDefault();
       event.stopPropagation();
-      const el = frozenEl;
-      unfreezeList();
-      if (el) el.scrollTop = el.scrollHeight;
+      unfreezeSnapshot();
     });
     (document.fullscreenElement || document.documentElement).appendChild(bottomBtn);
     return bottomBtn;
@@ -306,12 +284,16 @@
     btn.style.display = 'block';
   }
 
-  window.addEventListener('resize', () => { if (frozenEl) placeBottomBtn(); });
+  window.addEventListener('resize', () => {
+    if (frozenEl) placeBottomBtn();
+    placeOverlay();
+  });
 
   // 从事件目标往上找真正在滚的聊天容器，页面换布局也不会失去绑定。
   function scrollableFrom(node) {
     let el = node instanceof Element ? node : node && node.parentElement;
     for (; el && el !== document.body && el !== document.documentElement; el = el.parentElement) {
+      if (inOverlay(el)) return null;
       if (/(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY) &&
           el.scrollHeight > el.clientHeight + 4 && el.querySelector(ITEM_SELECTOR)) return el;
     }
@@ -325,8 +307,8 @@
 
   function chatScroller() {
     const list = [...document.querySelectorAll('.webcast-chatroom___list')]
-      .find(el => el.querySelector(ITEM_SELECTOR) && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY));
-    return list || scrollableFrom(document.querySelector(ITEM_SELECTOR));
+      .find(el => !inOverlay(el) && el.querySelector(ITEM_SELECTOR) && /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY));
+    return list || scrollableFrom([...document.querySelectorAll(ITEM_SELECTOR)].find(el => !inOverlay(el)));
   }
 
   function atBottom(el) {
@@ -335,94 +317,49 @@
 
   function bindScroller() {
     const el = chatScroller();
-    if (!el) return;
-    scroller = el;
-    // 列表节点被整块换掉时，接着冻新节点并尽量回到原画面。
-    if (paused && (!frozenEl || !frozenEl.isConnected)) freezeList(el, true);
+    if (el) scroller = el;
   }
 
   // 事件统一在 document 捕获阶段处理：抖音自己会拦滚轮事件，挂在列表上不保险。
   function onWheel(event) {
     const el = scrollerFor(event.target);
-    if (!el) return;
+    if (!el) return; // 快照里的滚动交给快照自己
     scroller = el;
-    lastDir = Math.sign(event.deltaY);
-    lastUserInput = Date.now();
     if (el.scrollHeight <= el.clientHeight + 4) return;
-    // 在底部继续往下滚时恢复自动跟随，其余情况先冻住。
-    if (event.deltaY > 0 && atBottom(el)) { if (paused) unfreezeList(); return; }
-    if (frozenEl !== el) freezeList(el, false);
-    else paused = true;
+    // 在底部继续往下滚就是回到实时弹幕；其余情况给当前画面拍快照。
+    if (event.deltaY > 0 && atBottom(el)) { if (overlay) unfreezeSnapshot(); return; }
+    if (!overlay || overlay.el !== el) freezeSnapshot(el, event.deltaY);
   }
 
-  function onTouchMove(event) {
+  // 触屏拖动过程中不拍快照，松手后按停下的位置拍。
+  function onTouchEnd(event) {
+    if (overlay) return;
     const el = scrollerFor(event.target);
     if (!el) return;
     scroller = el;
-    lastUserInput = Date.now();
     if (el.scrollHeight <= el.clientHeight + 4 || atBottom(el)) return;
-    if (frozenEl !== el) freezeList(el, false);
-  }
-
-  function onPointerDown(event) {
-    if (!(event.target instanceof Node)) return;
-    pointerHeld = true;
-    lastUserInput = Date.now();
-    const el = scrollerFor(event.target);
-    if (!el) return;
-    scroller = el;
-    if (event.target !== el) return;
-    // 点在滚动条/列表空白处时目标是列表本身，说明用户在手动拖动。
-    if (el.scrollHeight <= el.clientHeight + 4 || atBottom(el)) return;
-    if (frozenEl !== el) freezeList(el, false);
-  }
-
-  function onPointerMove() {
-    if (pointerHeld) lastUserInput = Date.now();
-  }
-
-  function onListScroll(event) {
-    const el = event.target;
-    if (!(el instanceof Element)) return;
-    if (pointerHeld) lastUserInput = Date.now();
-    // 从底部往上拖滚动条时 pointerdown 不会命中列表本身，这里补上冻结。
-    if (pointerHeld && !paused && el === scroller &&
-        el.scrollHeight > el.clientHeight + 4 && !atBottom(el)) {
-      freezeList(el, false);
-      return;
-    }
-    if (!paused || el !== frozenEl) return;
-    if (!atBottom(el)) return;
-    // 冻结期间站点写不进 scrollTop，滚到底只可能是用户自己在往下翻。
-    if (pointerHeld || (lastDir > 0 && Date.now() - lastUserInput < 600)) unfreezeList();
-  }
-
-  function onKey(event) {
-    if (!paused) return;
-    if (/^(PageUp|PageDown|ArrowUp|ArrowDown|Home|End| )$/.test(event.key)) lastUserInput = Date.now();
+    freezeSnapshot(el, 0);
   }
 
   document.addEventListener('wheel', onWheel, { passive: true, capture: true });
-  document.addEventListener('touchmove', onTouchMove, { passive: true, capture: true });
-  document.addEventListener('pointerdown', onPointerDown, { passive: true, capture: true });
-  document.addEventListener('pointermove', onPointerMove, { passive: true, capture: true });
-  document.addEventListener('scroll', onListScroll, { passive: true, capture: true });
-  document.addEventListener('keydown', onKey, { passive: true, capture: true });
-  window.addEventListener('pointerup', () => { pointerHeld = false; }, { passive: true, capture: true });
-  window.addEventListener('pointercancel', () => { pointerHeld = false; }, { passive: true, capture: true });
+  document.addEventListener('touchend', onTouchEnd, { passive: true, capture: true });
 
   bindScroller();
-  setInterval(bindScroller, 1500);
+  setInterval(() => {
+    bindScroller();
+    if (overlay && location.href !== frozenHref) unfreezeSnapshot();
+  }, 1500);
 
   // 抖音自己的「N 条新消息」按钮：先解冻，站点滚到底才生效。
   document.addEventListener('click', event => {
-    if (!frozenEl) return;
+    if (!overlay) return;
     const target = event.target instanceof Element ? event.target : null;
+    if (inOverlay(target)) return;
     const room = target?.closest('.webcast-chatroom');
     if (!room) return;
     for (let el = target, i = 0; el && el !== room && i < 5; i++, el = el.parentElement) {
       if (/^(\d+\s*条|有)?新消息$/.test((el.textContent || '').trim())) {
-        unfreezeList();
+        unfreezeSnapshot();
         return;
       }
     }
@@ -541,9 +478,12 @@
     toastTimer = setTimeout(() => { toastEl.style.opacity = '0'; }, 2200);
   }
   document.addEventListener('fullscreenchange', () => {
-    if (toastEl) (document.fullscreenElement || document.documentElement).appendChild(toastEl);
-    if (frozenEl) {
-      if (bottomBtn) (document.fullscreenElement || document.documentElement).appendChild(bottomBtn);
+    const root = document.fullscreenElement || document.documentElement;
+    if (toastEl) root.appendChild(toastEl);
+    // 全屏布局会变，快照位置对不上，直接回到实时弹幕。
+    if (overlay) { unfreezeSnapshot(); return; }
+    if (frozenEl && bottomBtn) {
+      root.appendChild(bottomBtn);
       placeBottomBtn();
     }
   });
